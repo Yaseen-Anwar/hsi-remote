@@ -93,6 +93,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: windows-2022
+          cache-on-failure: true # a failure after the long compile still keeps the compiled crates
 
       - name: Setup vcpkg with Github Actions binary cache
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
@@ -160,11 +161,11 @@ jobs:
         # Same features as build.py's `cargo build` above (--hwcodec --vram --flutter).
         run: cargo test --locked --release --lib --features hwcodec,vram,flutter test_hsi_client_locked
 
-      - name: HSI check - server built in, HSI name on the exe
+      # No text search of librustdesk.dll for the address: the optimizer builds short strings like
+      # "52.58.160.178" from immediates, so they are not in the file as text. The test above
+      # checks the compiled values against the secrets instead.
+      - name: HSI check - HSI name on the exe
         run: |
-          $dll = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("./rustdesk/librustdesk.dll"))
-          if (-not $dll.Contains($env:HSI_RENDEZVOUS_SERVER)) { throw "librustdesk.dll does not contain the HSI server address" }
-          if (-not $dll.Contains($env:HSI_RS_PUB_KEY)) { throw "librustdesk.dll does not contain the HSI server key" }
           $product = (Get-Item ./rustdesk/rustdesk.exe).VersionInfo.ProductName
           if ($product -ne 'HSI Remote') { throw "rustdesk.exe ProductName is '$product', expected 'HSI Remote'" }
           Write-Output "HSI checks passed"

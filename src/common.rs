@@ -2960,6 +2960,9 @@ mod tests {
 
     #[test]
     fn test_hsi_client_locked() {
+        // the values compiled in are the ones in the build's environment (the GitHub secrets)
+        assert_eq!(std::env::var("HSI_RENDEZVOUS_SERVER").as_deref(), Ok(HSI_SERVER));
+        assert_eq!(std::env::var("HSI_RS_PUB_KEY").as_deref(), Ok(HSI_KEY));
         load_custom_client();
         assert_eq!(Config::get_option("custom-rendezvous-server"), HSI_SERVER);
         assert_eq!(Config::get_option("relay-server"), HSI_SERVER);
