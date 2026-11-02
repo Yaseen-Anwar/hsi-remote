@@ -2363,8 +2363,20 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
 
 // HSI Remote: the server, key and locked settings are built in at compile time from the
 // GitHub secrets (see .github/workflows/hsi-windows.yml). RustDesk's signed custom.txt is never read.
-const HSI_SERVER: &str = env!("HSI_RENDEZVOUS_SERVER");
-const HSI_KEY: &str = env!("HSI_RS_PUB_KEY");
+const HSI_SERVER: &str = match option_env!("HSI_RENDEZVOUS_SERVER") {
+    Some(s) => s,
+    None => "",
+};
+const HSI_KEY: &str = match option_env!("HSI_RS_PUB_KEY") {
+    Some(s) => s,
+    None => "",
+};
+// A build without them must fail rather than fall back to RustDesk's public server. A const assert,
+// not env!(), so the bridge generator (bridge.yml, macro expansion only, no secrets) still runs.
+const _: () = assert!(
+    !HSI_SERVER.is_empty() && !HSI_KEY.is_empty(),
+    "set HSI_RENDEZVOUS_SERVER and HSI_RS_PUB_KEY"
+);
 
 fn hsi_custom_client() -> HashMap<String, Value> {
     let cfg = json!({
