@@ -1030,7 +1030,11 @@ pub fn check_software_update() {
 // No need to check `danger_accept_invalid_cert` for now.
 // Because the url is always `https://api.rustdesk.com/version/latest`.
 #[tokio::main(flavor = "current_thread")]
+#[allow(unreachable_code)] // the upstream body stays below to keep merges simple
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
+    // HSI Remote never asks RustDesk for updates: an update would replace it with stock RustDesk.
+    // The updater (updater.rs) calls this directly, bypassing check_software_update.
+    bail!("HSI Remote does not update from RustDesk");
     let (request, url) =
         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
     let proxy_conf = Config::get_socks();
@@ -2357,26 +2361,34 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
+// HSI Remote: the server, key and locked settings are built in at compile time from the
+// GitHub secrets (see .github/workflows/hsi-windows.yml). RustDesk's signed custom.txt is never read.
+const HSI_SERVER: &str = env!("HSI_RENDEZVOUS_SERVER");
+const HSI_KEY: &str = env!("HSI_RS_PUB_KEY");
+
+fn hsi_custom_client() -> HashMap<String, Value> {
+    let cfg = json!({
+        "app-name": "HSI Remote",
+        // account and address book need RustDesk Pro's API server
+        "disable-account": "Y",
+        "disable-ab": "Y",
+        "override-settings": {
+            "custom-rendezvous-server": HSI_SERVER,
+            "relay-server": HSI_SERVER,
+            "key": HSI_KEY,
+            "allow-auto-update": "N",
+            "enable-check-update": "N",
+            // the only users of the public STUN servers in hbb_common webrtc.rs
+            "enable-webrtc": "N",
+            "enable-ipv6-punch": "N",
+            "hide-server-settings": "Y",
+        },
+    });
+    serde_json::from_value(cfg).unwrap_or_default()
+}
+
 pub fn load_custom_client() {
-    #[cfg(debug_assertions)]
-    if let Ok(data) = std::fs::read_to_string("./custom.txt") {
-        read_custom_client(data.trim());
-        return;
-    }
-    let Some(path) = std::env::current_exe().map_or(None, |x| x.parent().map(|x| x.to_path_buf()))
-    else {
-        return;
-    };
-    #[cfg(target_os = "macos")]
-    let path = path.join("../Resources");
-    let path = path.join("custom.txt");
-    if path.is_file() {
-        let Ok(data) = std::fs::read_to_string(&path) else {
-            log::error!("Failed to read custom client config");
-            return;
-        };
-        read_custom_client(&data.trim());
-    }
+    apply_custom_client(hsi_custom_client());
 }
 
 fn read_custom_client_advanced_settings(
@@ -2455,27 +2467,12 @@ pub fn get_dst_align_rgba() -> usize {
     1
 }
 
-pub fn read_custom_client(config: &str) {
-    let Ok(data) = decode64(config) else {
-        log::error!("Failed to decode custom client config");
-        return;
-    };
-    const KEY: &str = "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=";
-    let Some(pk) = get_rs_pk(KEY) else {
-        log::error!("Failed to parse public key of custom client");
-        return;
-    };
-    let Ok(data) = sign::verify(&data, &pk) else {
-        log::error!("Failed to dec custom client config");
-        return;
-    };
-    let Ok(mut data) =
-        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&data)
-    else {
-        log::error!("Failed to parse custom client config");
-        return;
-    };
+// HSI Remote: a config handed in at runtime is ignored, the built-in one applies instead.
+pub fn read_custom_client(_config: &str) {
+    apply_custom_client(hsi_custom_client());
+}
 
+fn apply_custom_client(mut data: HashMap<String, Value>) {
     if let Some(app_name) = data.remove("app-name") {
         if let Some(app_name) = app_name.as_str() {
             *config::APP_NAME.write().unwrap() = app_name.to_owned();
@@ -2948,6 +2945,25 @@ pub fn is_valid_untrusted_peer_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hsi_client_locked() {
+        load_custom_client();
+        assert_eq!(Config::get_option("custom-rendezvous-server"), HSI_SERVER);
+        assert_eq!(Config::get_option("relay-server"), HSI_SERVER);
+        assert_eq!(Config::get_option("key"), HSI_KEY);
+        // a user (or a remote config change) can't move it to another server
+        Config::set_option("custom-rendezvous-server".into(), "evil.example".into());
+        assert_eq!(Config::get_option("custom-rendezvous-server"), HSI_SERVER);
+        assert_eq!(get_builtin_option("hide-server-settings"), "Y");
+        assert_eq!(get_local_option("enable-webrtc"), "N");
+        assert_eq!(get_local_option("enable-ipv6-punch"), "N");
+        assert_eq!(*config::APP_NAME.read().unwrap(), "HSI Remote");
+        assert!(config::is_disable_account() && config::is_disable_ab());
+        assert!(do_check_software_update().is_err());
+        #[cfg(windows)]
+        assert!(crate::platform::windows::get_license_from_exe_name().is_err());
+    }
     use hbb_common::tokio::{
         self,
         time::{interval, interval_at, sleep, Duration, Instant, Interval},
