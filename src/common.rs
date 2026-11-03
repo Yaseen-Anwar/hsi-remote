@@ -2380,7 +2380,9 @@ const _: () = assert!(
 
 fn hsi_custom_client() -> HashMap<String, Value> {
     let cfg = json!({
-        "app-name": "HSI Remote",
+        // no space: install puts it unquoted into sc/taskkill commands and the URL scheme
+        // (platform::windows::validate_install_app_name)
+        "app-name": "HSI-Remote",
         // account and address book need RustDesk Pro's API server
         "disable-account": "Y",
         "disable-ab": "Y",
@@ -2660,6 +2662,11 @@ async fn test_bind_ipv6() -> ResultType<SocketAddr> {
 }
 
 pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
+    // HSI Remote: the probe asks the public STUN servers (hbb_common webrtc.rs) for this PC's
+    // address, and test_nat_type runs it at every start. Without the IPv6 punch it has no use.
+    if !get_ipv6_punch_enabled() {
+        return None;
+    }
     {
         // One look and one claim of the minute, under one lock: two connections arriving
         // together would otherwise both find it over and both probe.
@@ -2973,7 +2980,12 @@ mod tests {
         assert_eq!(get_builtin_option("hide-server-settings"), "Y");
         assert_eq!(get_local_option("enable-webrtc"), "N");
         assert_eq!(get_local_option("enable-ipv6-punch"), "N");
-        assert_eq!(*config::APP_NAME.read().unwrap(), "HSI Remote");
+        // and no IPv6 probe of the public STUN servers either
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert!(rt.block_on(test_ipv6()).is_none());
+        assert_eq!(*config::APP_NAME.read().unwrap(), "HSI-Remote");
+        #[cfg(windows)]
+        assert!(crate::platform::windows::validate_install_app_name(&get_app_name()).is_ok());
         assert!(config::is_disable_account() && config::is_disable_ab());
         assert!(do_check_software_update().is_err());
         #[cfg(windows)]
