@@ -1,11 +1,11 @@
 [Desktop Entry]
-Name=RustDesk
+Name=HSI Remote
 NoDisplay=true
-MimeType=x-scheme-handler/rustdesk;
-TryExec=rustdesk
-Exec=rustdesk %u
-Icon=rustdesk
+MimeType=x-scheme-handler/hsi-remote;
+TryExec=hsi-remote
+Exec=hsi-remote %u
+Icon=hsi-remote
 Terminal=false
 Type=Application
 StartupNotify=false
-StartupWMClass=rustdesk
+StartupWMClass=hsi-remote

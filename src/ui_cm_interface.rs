@@ -845,7 +845,7 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tokio::main(flavor = "current_thread")]
 pub async fn start_ipc<T: InvokeUiCM>(cm: ConnectionManager<T>) {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     std::thread::spawn(hsi_disconnect_hotkey);
     #[cfg(target_os = "windows")]
     {
@@ -1777,23 +1777,33 @@ pub fn quit_cm() {
 }
 
 // HSI Remote: a key combination pressed at this PC ends every incoming session (Settings >
-// Security). The connection manager runs as the signed-in user while sessions are open, so
-// the hotkey is held only then and other programs keep the combination the rest of the time.
-#[cfg(target_os = "windows")]
+// Security). The connection manager runs as the signed-in user while sessions are open.
+// Windows registers it as a hotkey only while sessions are open, so other programs keep the
+// combination the rest of the time; Linux watches the keys on X11 (Wayland lets no app see
+// keys meant for other windows).
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 const HSI_HOTKEY_DEFAULT: &str = "Ctrl+Alt+Shift+D";
+// winuser.h MOD_*, so Windows hands the parsed value straight to RegisterHotKey
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+const HSI_MOD_ALT: u32 = 0x1;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+const HSI_MOD_CTRL: u32 = 0x2;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+const HSI_MOD_SHIFT: u32 = 0x4;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+const HSI_MOD_WIN: u32 = 0x8;
 
-/// "Ctrl+Alt+Shift+D" -> RegisterHotKey's (modifiers, virtual key). At least one modifier, and
+/// "Ctrl+Alt+Shift+D" -> (HSI_MOD_* bits, Windows virtual key). At least one modifier, and
 /// the key is A-Z, 0-9 or F1-F24, which is all the settings page lets you record.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn parse_hsi_hotkey(text: &str) -> Option<(u32, u32)> {
-    use winapi::um::winuser::{MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN};
     let (mut mods, mut vk) = (0, 0);
     for part in text.split('+').map(str::trim) {
         match part {
-            "Ctrl" => mods |= MOD_CONTROL,
-            "Alt" => mods |= MOD_ALT,
-            "Shift" => mods |= MOD_SHIFT,
-            "Win" => mods |= MOD_WIN,
+            "Ctrl" => mods |= HSI_MOD_CTRL,
+            "Alt" => mods |= HSI_MOD_ALT,
+            "Shift" => mods |= HSI_MOD_SHIFT,
+            "Win" => mods |= HSI_MOD_WIN,
             _ if vk != 0 => return None,
             k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
                 vk = k.as_bytes()[0].to_ascii_uppercase() as u32
@@ -1805,13 +1815,33 @@ fn parse_hsi_hotkey(text: &str) -> Option<(u32, u32)> {
             _ => return None,
         }
     }
-    (mods != 0 && vk != 0).then_some((mods as u32 | MOD_NOREPEAT as u32, vk))
+    (mods != 0 && vk != 0).then_some((mods, vk))
+}
+
+/// The hotkey from Settings, None when switched off.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn hsi_hotkey_setting() -> Option<(u32, u32)> {
+    let get = crate::ui_interface::get_option::<&str>;
+    if !option2bool("enable-hsi-disconnect-hotkey", &get("enable-hsi-disconnect-hotkey")) {
+        return None;
+    }
+    let text = get("hsi-disconnect-hotkey");
+    parse_hsi_hotkey(if text.is_empty() { HSI_HOTKEY_DEFAULT } else { &text })
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn hsi_close_all_sessions() {
+    let ids: Vec<i32> = CLIENTS.read().unwrap().keys().copied().collect();
+    log::info!("disconnect hotkey pressed, closing {} session(s)", ids.len());
+    ids.into_iter().for_each(close);
 }
 
 #[cfg(target_os = "windows")]
 fn hsi_disconnect_hotkey() {
     use std::{ptr::null_mut, time::Duration, time::Instant};
-    use winapi::um::winuser::{PeekMessageW, RegisterHotKey, UnregisterHotKey, MSG, PM_REMOVE, WM_HOTKEY};
+    use winapi::um::winuser::{
+        PeekMessageW, RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, MSG, PM_REMOVE, WM_HOTKEY,
+    };
     const ID: i32 = 1;
     let (mut setting, mut read_at) = (None, None::<Instant>);
     let (mut applied, mut registered) = (None, false);
@@ -1819,13 +1849,7 @@ fn hsi_disconnect_hotkey() {
         // re-read now and then so a change in Settings applies to a session already open
         if read_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(3)) {
             read_at = Some(Instant::now());
-            let get = crate::ui_interface::get_option::<&str>;
-            setting = if option2bool("enable-hsi-disconnect-hotkey", &get("enable-hsi-disconnect-hotkey")) {
-                let text = get("hsi-disconnect-hotkey");
-                parse_hsi_hotkey(if text.is_empty() { HSI_HOTKEY_DEFAULT } else { &text })
-            } else {
-                None
-            };
+            setting = hsi_hotkey_setting();
         }
         let want = setting.filter(|_| !CLIENTS.read().unwrap().is_empty());
         if want != applied {
@@ -1833,7 +1857,9 @@ fn hsi_disconnect_hotkey() {
                 if registered {
                     UnregisterHotKey(null_mut(), ID);
                 }
-                registered = want.map_or(false, |(mods, vk)| RegisterHotKey(null_mut(), ID, mods, vk) != 0);
+                registered = want.map_or(false, |(mods, vk)| {
+                    RegisterHotKey(null_mut(), ID, mods | MOD_NOREPEAT as u32, vk) != 0
+                });
             }
             if want.is_some() && !registered {
                 log::warn!("disconnect hotkey not registered, another program holds it");
@@ -1843,12 +1869,72 @@ fn hsi_disconnect_hotkey() {
         let mut msg: MSG = unsafe { std::mem::zeroed() };
         while unsafe { PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) } != 0 {
             if msg.message == WM_HOTKEY {
-                let ids: Vec<i32> = CLIENTS.read().unwrap().keys().copied().collect();
-                log::info!("disconnect hotkey pressed, closing {} session(s)", ids.len());
-                ids.into_iter().for_each(close);
+                hsi_close_all_sessions();
             }
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A pressed key as parse_hsi_hotkey's numbers: (HSI_MOD_* bit for a modifier, else 0; virtual key).
+/// Built on Windows too, so the Windows build's tests check it.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn hsi_rdev_key(key: &rdev::Key) -> (u32, Option<u32>) {
+    use rdev::Key::*;
+    const LETTERS: [rdev::Key; 26] = [
+        KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO,
+        KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ,
+    ];
+    const DIGITS: [rdev::Key; 10] = [Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9];
+    const FKEYS: [rdev::Key; 24] = [
+        F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20,
+        F21, F22, F23, F24,
+    ];
+    let pos = |keys: &[rdev::Key]| keys.iter().position(|k| k == key).map(|i| i as u32);
+    let modifier = match key {
+        ControlLeft | ControlRight => HSI_MOD_CTRL,
+        Alt | AltGr => HSI_MOD_ALT,
+        ShiftLeft | ShiftRight => HSI_MOD_SHIFT,
+        MetaLeft | MetaRight => HSI_MOD_WIN,
+        _ => 0,
+    };
+    let vk = (pos(&LETTERS).map(|i| 'A' as u32 + i))
+        .or_else(|| pos(&DIGITS).map(|i| '0' as u32 + i))
+        .or_else(|| pos(&FKEYS).map(|i| 0x70 + i));
+    (modifier, vk)
+}
+
+#[cfg(target_os = "linux")]
+fn hsi_disconnect_hotkey() {
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    let setting = Arc::new(Mutex::new(None));
+    let reader = setting.clone();
+    std::thread::spawn(move || loop {
+        // re-read now and then so a change in Settings applies to a session already open
+        *reader.lock().unwrap() = hsi_hotkey_setting();
+        std::thread::sleep(Duration::from_secs(3));
+    });
+    let mut held = 0u32;
+    let res = rdev::listen(move |event| match event.event_type {
+        rdev::EventType::KeyPress(key) => match hsi_rdev_key(&key) {
+            (0, Some(vk)) => {
+                if *setting.lock().unwrap() == Some((held, vk))
+                    && !CLIENTS.read().unwrap().is_empty()
+                {
+                    hsi_close_all_sessions();
+                }
+            }
+            (modifier, _) => held |= modifier,
+        },
+        rdev::EventType::KeyRelease(key) => held &= !hsi_rdev_key(&key).0,
+        _ => {}
+    });
+    if let Err(err) = res {
+        log::warn!("disconnect hotkey unavailable, keys cannot be watched (Wayland?): {err:?}");
     }
 }
 
@@ -1859,18 +1945,28 @@ mod tests {
     use crate::ipc::Data;
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn test_parse_hsi_hotkey() {
-        use winapi::um::winuser::{MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT};
-        let m = |mods: isize| mods as u32 | MOD_NOREPEAT as u32;
-        assert_eq!(parse_hsi_hotkey(HSI_HOTKEY_DEFAULT), Some((m(MOD_CONTROL | MOD_ALT | MOD_SHIFT), 'D' as u32)));
-        assert_eq!(parse_hsi_hotkey("Ctrl+F12"), Some((m(MOD_CONTROL), 0x7B)));
-        assert_eq!(parse_hsi_hotkey("Alt+7"), Some((m(MOD_ALT), '7' as u32)));
-        assert_eq!(parse_hsi_hotkey("Shift+F1"), Some((m(MOD_SHIFT), 0x70)));
+        let ctrl_alt_shift = HSI_MOD_CTRL | HSI_MOD_ALT | HSI_MOD_SHIFT;
+        assert_eq!(parse_hsi_hotkey(HSI_HOTKEY_DEFAULT), Some((ctrl_alt_shift, 'D' as u32)));
+        assert_eq!(parse_hsi_hotkey("Ctrl+F12"), Some((HSI_MOD_CTRL, 0x7B)));
+        assert_eq!(parse_hsi_hotkey("Alt+7"), Some((HSI_MOD_ALT, '7' as u32)));
+        assert_eq!(parse_hsi_hotkey("Win+Shift+F1"), Some((HSI_MOD_WIN | HSI_MOD_SHIFT, 0x70)));
         // a key on its own would fire while typing; two keys or unknown names are not a hotkey
         for bad in ["D", "F12", "Ctrl", "Ctrl+A+B", "Ctrl+F25", "Ctrl+Esc", "", "Ctrl+"] {
             assert_eq!(parse_hsi_hotkey(bad), None, "{bad}");
         }
+        // the Linux key watcher turns pressed keys into the same numbers
+        use rdev::Key::*;
+        assert_eq!(hsi_rdev_key(&ControlRight), (HSI_MOD_CTRL, None));
+        assert_eq!(hsi_rdev_key(&AltGr), (HSI_MOD_ALT, None));
+        assert_eq!(hsi_rdev_key(&MetaLeft), (HSI_MOD_WIN, None));
+        assert_eq!(hsi_rdev_key(&KeyD), (0, Some('D' as u32)));
+        assert_eq!(hsi_rdev_key(&KeyZ), (0, Some('Z' as u32)));
+        assert_eq!(hsi_rdev_key(&Num7), (0, Some('7' as u32)));
+        assert_eq!(hsi_rdev_key(&F12), (0, Some(0x7B)));
+        assert_eq!(hsi_rdev_key(&F24), (0, Some(0x87)));
+        assert_eq!(hsi_rdev_key(&Escape), (0, None));
     }
     use base::message_proto::{FileDirectory, Message};
     use hbb_common::tokio::{runtime::Runtime, sync::mpsc::unbounded_channel};
