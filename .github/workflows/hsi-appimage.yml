@@ -71,6 +71,8 @@ jobs:
       - name: HSI check - AppImage starts
         run: |
           app=$(ls appimage/hsi-remote-${{ env.VERSION }}-*.AppImage)
+          # appimage-builder ran with sudo, so root owns it; start it as a user would
+          sudo chown "$(id -u):$(id -g)" "$app"
           chmod +x "$app"
           out=$("$app" --version)
           echo "$out"
