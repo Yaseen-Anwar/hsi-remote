@@ -1215,7 +1215,11 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             if (isWindows)
               _OptionCheckBox(context, 'Enable blocking user input',
                   kOptionEnableBlockInput,
-                  enabled: enabled, fakeValue: fakeValue),
+                  enabled: enabled,
+                  // HSI Remote: blocked input would block the disconnect hotkey too
+                  fakeValue: mainGetBoolOptionSync(kHsiHotkeyEnableOption)
+                      ? false
+                      : fakeValue),
             if (bind.mainSupportedPrivacyModeImpls() != '[]')
               _OptionCheckBox(
                   context, 'Enable privacy mode', kOptionEnablePrivacyMode,
@@ -1398,6 +1402,13 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       whitelist(),
       idWhitelist(),
       ...autoDisconnect(context),
+      ...autoDisconnect(context,
+          label: 'End incoming sessions after a set time',
+          allowKey: 'allow-hsi-session-limit',
+          minutesKey: 'hsi-session-limit',
+          minutesLabel: 'Time limit in minutes',
+          hint: '60'),
+      ...hsiDisconnectHotkey(context),
       _OptionCheckBox(context, 'keep-awake-during-incoming-sessions-label',
           kOptionKeepAwakeDuringIncomingSessions,
           reverse: false, enabled: enabled),
@@ -1640,26 +1651,30 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
         }));
   }
 
-  List<Widget> autoDisconnect(BuildContext context) {
+  // HSI Remote: also draws "End incoming sessions after a set time" (connection.rs, hsi_session_limit)
+  List<Widget> autoDisconnect(BuildContext context,
+      {String label = 'auto_disconnect_option_tip',
+      String allowKey = kOptionAllowAutoDisconnect,
+      String minutesKey = kOptionAutoDisconnectTimeout,
+      String minutesLabel = 'Timeout in minutes',
+      String hint = '10'}) {
     TextEditingController controller = TextEditingController();
     update(bool v) => setState(() {});
     RxBool applyEnabled = false.obs;
     return [
-      _OptionCheckBox(
-          context, 'auto_disconnect_option_tip', kOptionAllowAutoDisconnect,
+      _OptionCheckBox(context, label, allowKey,
           update: update, enabled: !locked),
       () {
-        bool enabled = option2bool(kOptionAllowAutoDisconnect,
-            bind.mainGetOptionSync(key: kOptionAllowAutoDisconnect));
+        bool enabled =
+            option2bool(allowKey, bind.mainGetOptionSync(key: allowKey));
         if (!enabled) applyEnabled.value = false;
-        controller.text =
-            bind.mainGetOptionSync(key: kOptionAutoDisconnectTimeout);
-        final isOptFixed = isOptionFixed(kOptionAutoDisconnectTimeout);
+        controller.text = bind.mainGetOptionSync(key: minutesKey);
+        final isOptFixed = isOptionFixed(minutesKey);
         return Offstage(
           offstage: !enabled,
           child: _SubLabeledWidget(
             context,
-            'Timeout in minutes',
+            minutesLabel,
             Row(children: [
               SizedBox(
                 width: 95,
@@ -1671,8 +1686,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                     FilteringTextInputFormatter.allow(RegExp(
                         r'^([0-9]|[1-9]\d|[1-9]\d{2}|[1-9]\d{3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$')),
                   ],
-                  decoration: const InputDecoration(
-                    hintText: '10',
+                  decoration: InputDecoration(
+                    hintText: hint,
                     contentPadding:
                         EdgeInsets.symmetric(vertical: 12, horizontal: 12),
                   ),
@@ -1684,8 +1699,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                             ? () async {
                                 applyEnabled.value = false;
                                 await bind.mainSetOption(
-                                    key: kOptionAutoDisconnectTimeout,
-                                    value: controller.text);
+                                    key: minutesKey, value: controller.text);
                               }
                             : null,
                     child: Text(
@@ -1697,6 +1711,37 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
           ),
         );
       }(),
+    ];
+  }
+
+  // HSI Remote: a key combination pressed at this PC ends every incoming session.
+  // The connection manager holds it (ui_cm_interface.rs, hsi_disconnect_hotkey).
+  List<Widget> hsiDisconnectHotkey(BuildContext context) {
+    update(bool v) => setState(() {});
+    final enabled = mainGetBoolOptionSync(kHsiHotkeyEnableOption);
+    final hotkey = bind.mainGetOptionSync(key: kHsiHotkeyOption);
+    return [
+      _OptionCheckBox(context, 'Disconnect all incoming sessions with a hotkey',
+          kHsiHotkeyEnableOption,
+          update: update, enabled: !locked),
+      Offstage(
+        offstage: !enabled,
+        child: _SubLabeledWidget(
+          context,
+          'Hotkey',
+          Row(children: [
+            Text(hotkey.isEmpty ? kHsiHotkeyDefault : hotkey,
+                    style: const TextStyle(fontWeight: FontWeight.bold))
+                .marginOnly(right: 15),
+            ElevatedButton(
+              onPressed:
+                  locked ? null : () => _recordHsiHotkey(() => setState(() {})),
+              child: Text(translate('Change')),
+            ),
+          ]),
+          enabled: !locked,
+        ),
+      ),
     ];
   }
 
@@ -2940,6 +2985,71 @@ Widget _SubButton(String label, Function() onPressed, [bool enabled = true]) {
       ),
     ],
   ).marginOnly(left: _kContentHSubMargin);
+}
+
+const kHsiHotkeyOption = 'hsi-disconnect-hotkey';
+// also refuses "Block user input" (connection.rs, hsi_block_input_allowed)
+const kHsiHotkeyEnableOption = 'enable-hsi-disconnect-hotkey';
+const kHsiHotkeyDefault = 'Ctrl+Alt+Shift+D'; // HSI_HOTKEY_DEFAULT in ui_cm_interface.rs
+
+// "Ctrl+Alt+Shift+D" for the keys held now, or null unless it is at least one of
+// Ctrl/Alt/Shift/Win plus A-Z, 0-9 or F1-F24: what parse_hsi_hotkey accepts.
+String? _hsiHotkeyName(KeyEvent e) {
+  final k = HardwareKeyboard.instance;
+  final mods = [
+    if (k.isControlPressed) 'Ctrl',
+    if (k.isAltPressed) 'Alt',
+    if (k.isShiftPressed) 'Shift',
+    if (k.isMetaPressed) 'Win',
+  ];
+  final key = e.logicalKey.keyLabel.toUpperCase();
+  if (mods.isEmpty ||
+      !RegExp(r'^([A-Z0-9]|F([1-9]|1[0-9]|2[0-4]))$').hasMatch(key)) {
+    return null;
+  }
+  return [...mods, key].join('+');
+}
+
+void _recordHsiHotkey(Function() onSaved) {
+  String recorded = '';
+  StateSetter? refresh;
+  // a keyboard handler rather than a Focus widget: it sees the keys wherever focus is
+  bool onKey(KeyEvent e) {
+    final name = e is KeyDownEvent ? _hsiHotkeyName(e) : null;
+    if (name == null) return false;
+    refresh?.call(() => recorded = name);
+    return true;
+  }
+
+  HardwareKeyboard.instance.addHandler(onKey);
+  gFFI.dialogManager.show((setState, close, context) {
+    refresh = setState;
+    submit() async {
+      await bind.mainSetOption(key: kHsiHotkeyOption, value: recorded);
+      close();
+      onSaved();
+    }
+
+    return CustomAlertDialog(
+      title: Text(translate('Disconnect hotkey')),
+      content: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(translate(
+              'Press the new key combination: Ctrl, Alt, Shift or Win together with a letter, a digit or F1 to F24.')),
+          Text(recorded.isEmpty ? '...' : recorded,
+                  style: const TextStyle(
+                      fontSize: 20, fontWeight: FontWeight.bold))
+              .marginOnly(top: 16),
+        ],
+      ),
+      actions: [
+        dialogButton('Cancel', onPressed: close, isOutline: true),
+        dialogButton('OK', onPressed: recorded.isEmpty ? null : submit),
+      ],
+      onCancel: close,
+    );
+  }).whenComplete(() => HardwareKeyboard.instance.removeHandler(onKey));
 }
 
 // ignore: non_constant_identifier_names

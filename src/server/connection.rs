@@ -430,6 +430,7 @@ pub struct Connection {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     start_cm_ipc_para: Option<StartCmIpcPara>,
     auto_disconnect_timer: Option<(Instant, u64)>,
+    hsi_session_deadline: Option<Instant>,
     authed_conn_id: Option<self::raii::AuthedConnID>,
     file_remove_log_control: FileRemoveLogControl,
     last_supported_encoding: Option<SupportedEncoding>,
@@ -594,7 +595,8 @@ impl Connection {
             file: Self::permission(keys::OPTION_ENABLE_FILE_TRANSFER, &control_permissions),
             restart: Self::permission(keys::OPTION_ENABLE_REMOTE_RESTART, &control_permissions),
             recording: Self::permission(keys::OPTION_ENABLE_RECORD_SESSION, &control_permissions),
-            block_input: Self::permission(keys::OPTION_ENABLE_BLOCK_INPUT, &control_permissions),
+            block_input: Self::permission(keys::OPTION_ENABLE_BLOCK_INPUT, &control_permissions)
+                && hsi_block_input_allowed(),
             privacy_mode: Self::permission(keys::OPTION_ENABLE_PRIVACY_MODE, &control_permissions),
             control_permissions,
             last_test_delay: None,
@@ -639,6 +641,7 @@ impl Connection {
                 tx_from_cm,
             }),
             auto_disconnect_timer: None,
+            hsi_session_deadline: None,
             authed_conn_id: None,
             file_remove_log_control: FileRemoveLogControl::new(id),
             last_supported_encoding: None,
@@ -862,8 +865,8 @@ impl Connection {
                                 conn.recording = enabled;
                                 conn.send_permission(Permission::Recording, enabled).await;
                             } else if &name == "block_input" {
-                                conn.block_input = enabled;
-                                conn.send_permission(Permission::BlockInput, enabled).await;
+                                conn.block_input = enabled && hsi_block_input_allowed();
+                                conn.send_permission(Permission::BlockInput, conn.block_input).await;
                             } else if &name == "privacy_mode" {
                                 // Keep permission state and runtime state consistent:
                                 // when revoking the permission, try to leave privacy mode first.
@@ -1167,6 +1170,11 @@ impl Connection {
                             break;
                         }
                     }
+                    if conn.hsi_session_deadline.map_or(false, |deadline| Instant::now() >= deadline) {
+                        conn.send_close_reason_no_retry("Session time limit reached").await;
+                        conn.on_close("session time limit", true).await;
+                        break;
+                    }
                     conn.file_remove_log_control.on_timer().drain(..).map(|x| conn.send_to_cm(x)).count();
                     #[cfg(feature = "hwcodec")]
                     conn.update_supported_encoding();
@@ -1371,6 +1379,9 @@ impl Connection {
                     _ = self.timer.tick() => {
                         if last_recv_time.elapsed() >= H1 {
                             bail!("Timeout");
+                        }
+                        if self.hsi_session_deadline.map_or(false, |deadline| Instant::now() >= deadline) {
+                            bail!("Session time limit reached");
                         }
                     }
                     Ok(conns) = hbbs_rx.recv() => {
@@ -1890,6 +1901,12 @@ impl Connection {
         }
         self.authorized = true;
         self.unauthorized_id = None;
+        // every session type passes here: remote control, file transfer, terminal, port forward
+        self.hsi_session_deadline = hsi_session_limit(
+            &Config::get_option("allow-hsi-session-limit"),
+            &Config::get_option("hsi-session-limit"),
+        )
+        .map(|limit| Instant::now() + limit);
         // One-time means gone once it has let a peer in, not once that peer
         // leaves. This session's later logins come in on the password the
         // session remembers, so they are not affected.
@@ -5021,7 +5038,11 @@ impl Connection {
             }
         }
         if let Ok(q) = o.block_input.enum_value() {
-            if self.keyboard && self.block_input {
+            // turning it off stays allowed: the hotkey may have been switched on mid-session
+            if self.keyboard
+                && self.block_input
+                && (q != BoolOption::Yes || hsi_block_input_allowed())
+            {
                 match q {
                     BoolOption::Yes => {
                         self.tx_input.send(MessageInput::BlockOn).ok();
@@ -7112,10 +7133,40 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+// HSI Remote: Settings > Security "End incoming sessions after a set time". Unlike
+// allow-auto-disconnect it counts from the start of the session, used or not.
+fn hsi_session_limit(allow: &str, minutes: &str) -> Option<Duration> {
+    if allow != "Y" {
+        return None;
+    }
+    let minutes = minutes.parse::<u64>().ok().filter(|&m| m > 0).unwrap_or(60);
+    Some(Duration::from_secs(minutes * 60))
+}
+
+// HSI Remote: "Block user input" would block this PC's keyboard and with it the disconnect
+// hotkey (ui_cm_interface.rs, hsi_disconnect_hotkey), so the two never go together.
+fn hsi_block_input_allowed() -> bool {
+    !config::option2bool(
+        "enable-hsi-disconnect-hotkey",
+        &Config::get_option("enable-hsi-disconnect-hotkey"),
+    )
+}
+
 #[cfg(test)]
 mod test {
     #[allow(unused)]
     use super::*;
+
+    #[test]
+    fn test_hsi_session_limit() {
+        assert_eq!(hsi_session_limit("", "30"), None);
+        assert_eq!(hsi_session_limit("N", "30"), None);
+        assert_eq!(hsi_session_limit("Y", "30"), Some(Duration::from_secs(30 * 60)));
+        // nothing typed, 0 or rubbish: an hour rather than no limit
+        assert_eq!(hsi_session_limit("Y", ""), Some(Duration::from_secs(3600)));
+        assert_eq!(hsi_session_limit("Y", "0"), Some(Duration::from_secs(3600)));
+        assert_eq!(hsi_session_limit("Y", "abc"), Some(Duration::from_secs(3600)));
+    }
 
     // The registry is process-global and the harness runs tests in parallel threads, so every
     // test that admits connections holds this first; a poisoned lock is still a lock.

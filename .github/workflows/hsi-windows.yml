@@ -159,7 +159,7 @@ jobs:
 
       - name: HSI test - server and settings are locked
         # Same features as build.py's `cargo build` above (--hwcodec --vram --flutter).
-        run: cargo test --locked --release --lib --features hwcodec,vram,flutter test_hsi_client_locked
+        run: cargo test --locked --release --lib --features hwcodec,vram,flutter -- test_hsi_client_locked test_hsi_session_limit test_parse_hsi_hotkey
 
       - name: Download RustDeskTempTopMostWindow artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

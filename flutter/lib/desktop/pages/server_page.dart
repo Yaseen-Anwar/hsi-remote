@@ -822,7 +822,10 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
                         canModify: canModifyPermission,
                       ),
                       // only windows support block input
-                      if (isWindows)
+                      // HSI Remote: refused while the disconnect hotkey is on (connection.rs)
+                      if (isWindows &&
+                          !mainGetBoolOptionSync(
+                              'enable-hsi-disconnect-hotkey'))
                         buildPermissionIcon(
                           client.blockInput,
                           Icons.block,
