@@ -1,0 +1,78 @@
+# HSI Remote: x86_64 AppImage made from the Linux build's deb (upstream's build-appimage job at
+# tag 1.5.0). Runs after every "HSI Remote - Linux build" (hsi-linux.yml calls it), or on its own
+# from a finished one: give that run's id.
+name: HSI Remote - AppImage
+
+on:
+  workflow_dispatch:
+    inputs:
+      deb_run_id:
+        description: "Run id of a finished HSI Remote - Linux build"
+        required: true
+  workflow_call:
+    inputs:
+      deb_run_id:
+        type: string
+        required: false
+
+env:
+  VERSION: "1.5.0"
+
+jobs:
+  build-appimage:
+    name: x86_64 AppImage
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read # the deb artifact of another run
+      contents: read
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Download the deb
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hsi-remote-linux
+          path: .
+          run-id: ${{ inputs.deb_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Rename the deb
+        run: mv hsi-remote-${{ env.VERSION }}-x86_64.deb appimage/hsi-remote.deb
+
+      - name: Build appimage package
+        shell: bash
+        run: |
+          # install libarchive-tools for bsdtar command used in AppImageBuilder.yml
+          sudo apt-get update -y
+          # https://github.com/AppImage/AppImageKit/wiki/FUSE
+          sudo apt-get install -y libarchive-tools libfuse2
+          # set-up appimage-builder
+          # https://github.com/AppImage/AppImageKit/issues/1395
+          sudo pip3 install "setuptools_scm<10"
+          sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
+          # run appimage-builder
+          pushd appimage
+          ./build-apprun.sh x86_64
+          sudo appimage-builder --skip-tests --recipe ./AppImageBuilder-x86_64.yml
+          cmp AppDir/AppRun appimage-build/AppRun/v2.0.0/AppRun-Release-x86_64
+
+      - name: Upload HSI Remote AppImage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hsi-remote-appimage
+          path: appimage/hsi-remote-${{ env.VERSION }}-*.AppImage
+          if-no-files-found: error
+
+      # Starts the AppImage the way a user's double-click would (AppRun, bundled libraries,
+      # librustdesk.so); --version exits before any window opens, so no display is needed.
+      - name: HSI check - AppImage starts
+        run: |
+          app=$(ls appimage/hsi-remote-${{ env.VERSION }}-*.AppImage)
+          chmod +x "$app"
+          out=$("$app" --version)
+          echo "$out"
+          echo "$out" | grep -q "${{ env.VERSION }}"
+          echo "AppImage check passed"

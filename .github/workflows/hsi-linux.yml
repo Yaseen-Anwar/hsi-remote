@@ -219,3 +219,10 @@ jobs:
           systemctl is-active hsi-remote
           pgrep -af 'hsi-remote --service'
           echo "install check passed"
+
+  appimage:
+    needs: [build-linux]
+    permissions:
+      actions: read # hsi-appimage.yml downloads the deb through the API
+      contents: read
+    uses: ./.github/workflows/hsi-appimage.yml
