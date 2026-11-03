@@ -196,3 +196,18 @@ jobs:
           name: hsi-remote-windows
           path: ./output/HSI-Remote-*.exe
           if-no-files-found: error
+
+      # Installs on the build machine as "Accept and install" does, so an install whose service
+      # and shortcuts point at a missing exe fails the build. After the upload, so the exe is
+      # still there to look at.
+      - name: HSI check - install works
+        timeout-minutes: 10
+        run: |
+          # WaitForExit, not -Wait: the install leaves the tray process running
+          (Start-Process ./rustdesk/rustdesk.exe -ArgumentList '--silent-install' -PassThru).WaitForExit()
+          $exe = 'C:\Program Files\HSI-Remote\HSI-Remote.exe'
+          if (-not (Test-Path $exe)) { throw "$exe missing after install" }
+          Start-Sleep 10
+          $status = (Get-Service HSI-Remote).Status
+          if ($status -ne 'Running') { throw "HSI-Remote service is $status after install" }
+          Write-Output "install check passed"
